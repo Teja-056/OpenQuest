@@ -35,7 +35,8 @@ def validate_employee_payload(data):
     if not EMAIL_REGEX.match(email):
         return False, "Invalid email address format", None
 
-    # Optional employee_id
+    # Optional employee_id and organization_id
+    organization_id = str(data.get("organization_id", "org_default")).strip() or "org_default"
     employee_id = data.get("employee_id")
     if employee_id:
         if not isinstance(employee_id, str) or not employee_id.strip():
@@ -60,6 +61,7 @@ def validate_employee_payload(data):
 
     cleaned = {
         "employee_id": employee_id,
+        "organization_id": organization_id,
         "name": name,
         "email": email,
         "department": department,
@@ -165,8 +167,12 @@ def validate_event_payload(data):
     if recommended_action is not None:
         recommended_action = str(recommended_action).strip()
 
+    # Optional organization_id
+    organization_id = str(data.get("organization_id", "org_default")).strip() or "org_default"
+
     cleaned = {
         "event_id": event_id,
+        "organization_id": organization_id,
         "event_type": event_type,
         "actor_type": actor_type,
         "actor_id": actor_id,

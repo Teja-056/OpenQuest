@@ -1,21 +1,30 @@
+import re
 import uuid
 from flask import Blueprint, request
-from backend.database import get_supabase_client
+from backend.repository import Repository
+from backend.auth import get_tenant_organization_id
 from backend.utils.response import api_response, error_response
 from backend.utils.validation import get_current_iso_timestamp
 
 alerts_bp = Blueprint("alerts", __name__)
 
 VALID_SEVERITIES = {"low", "medium", "high", "critical"}
+DANGEROUS_QUERY_CHARS = re.compile(r"['\";]|--|/\*|\*/")
 
 @alerts_bp.route("/api/alerts", methods=["GET"])
 def get_alerts():
     """
-    Retrieve security alerts from Supabase PostgreSQL.
+    Retrieve security alerts partitioned by tenant organization.
     Supports optional filters: severity, is_read, limit, offset.
     """
     severity = request.args.get("severity")
     is_read_param = request.args.get("is_read")
+    org_id = get_tenant_organization_id()
+
+    # Input sanitization
+    for param_name, param_val in [("severity", severity), ("is_read", is_read_param)]:
+        if param_val and DANGEROUS_QUERY_CHARS.search(param_val):
+            return error_response(f"Invalid characters detected in query parameter '{param_name}'", 400)
 
     try:
         limit = min(int(request.args.get("limit", 50)), 200)
@@ -23,39 +32,31 @@ def get_alerts():
     except ValueError:
         return error_response("Query parameters 'limit' and 'offset' must be valid integers", 400)
 
-    try:
-        supabase = get_supabase_client()
-        query = supabase.table("alerts").select("*", count="exact")
+    filters = {}
+    if severity:
+        filters["severity"] = severity.lower()
+    if is_read_param is not None:
+        filters["is_read"] = is_read_param.lower() in ("true", "1")
 
-        if severity:
-            query = query.eq("severity", severity.lower())
-        if is_read_param is not None:
-            is_read_val = is_read_param.lower() in ("true", "1")
-            query = query.eq("is_read", is_read_val)
+    alerts, total_count = Repository.list_alerts(
+        organization_id=org_id,
+        filters=filters,
+        limit=limit,
+        offset=offset
+    )
 
-        query = query.order("created_at", desc=True).range(offset, offset + limit - 1)
-        res = query.execute()
-
-        alerts = res.data or []
-        total_count = res.count if res.count is not None else len(alerts)
-
-        meta = {
-            "total": total_count,
-            "limit": limit,
-            "offset": offset,
-            "returned": len(alerts)
-        }
-        return api_response(data=alerts, message="Alerts retrieved successfully", meta=meta, status_code=200)
-
-    except RuntimeError as re:
-        return error_response("Database configuration error", 503, details=str(re))
-    except Exception as e:
-        return error_response("Failed to retrieve alerts from Supabase", 500, details=str(e))
+    meta = {
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+        "returned": len(alerts)
+    }
+    return api_response(data=alerts, message="Alerts retrieved successfully", meta=meta, status_code=200)
 
 @alerts_bp.route("/api/alerts", methods=["POST"])
 def create_alert():
     """
-    Create a new alert in Supabase PostgreSQL.
+    Create a new alert within tenant organization.
     """
     if not request.is_json:
         return error_response("Request body must be JSON with Content-Type: application/json", 400)
@@ -79,9 +80,11 @@ def create_alert():
     alert_type = str(data["alert_type"]).strip()
     message = str(data["message"]).strip()
     now_iso = get_current_iso_timestamp()
+    org_id = get_tenant_organization_id()
 
     alert_record = {
         "alert_id": alert_id,
+        "organization_id": org_id,
         "event_id": event_id,
         "incident_id": incident_id,
         "alert_type": alert_type,
@@ -91,16 +94,37 @@ def create_alert():
         "created_at": now_iso
     }
 
-    try:
-        supabase = get_supabase_client()
-        insert_res = supabase.table("alerts").insert(alert_record).execute()
-        saved = insert_res.data[0] if insert_res.data else alert_record
-        return api_response(data=saved, message="Alert created successfully", status_code=201)
+    saved = Repository.create_alert(alert_record)
+    return api_response(data=saved, message="Alert created successfully", status_code=201)
 
-    except RuntimeError as re:
-        return error_response("Database configuration error", 503, details=str(re))
-    except Exception as e:
-        err_str = str(e)
-        if "23505" in err_str or "duplicate key" in err_str:
-            return error_response("Duplicate alert ID conflict", 409, details=err_str)
-        return error_response("Failed to create alert", 500, details=err_str)
+@alerts_bp.route("/api/alerts/<alert_id>", methods=["PATCH", "PUT"])
+def update_alert(alert_id):
+    """
+    Update alert read/acknowledged status.
+    """
+    if not request.is_json:
+        return error_response("Request body must be JSON", 400)
+
+    data = request.get_json()
+    is_read = data.get("is_read")
+    if is_read is None:
+        return error_response("Field 'is_read' boolean required", 400)
+
+    org_id = get_tenant_organization_id()
+    updated = Repository.update_alert(alert_id, {"is_read": bool(is_read)}, organization_id=org_id)
+    if not updated:
+        return error_response(f"Alert '{alert_id}' not found", 404)
+    return api_response(data=updated, message="Alert updated successfully", status_code=200)
+
+@alerts_bp.route("/api/alerts/acknowledge-all", methods=["POST"])
+def acknowledge_all_alerts():
+    """
+    Mark all unread alerts as read for the authorized organization.
+    """
+    org_id = get_tenant_organization_id()
+    alerts, _ = Repository.list_alerts(organization_id=org_id, filters={"is_read": False}, limit=200)
+    count = 0
+    for a in alerts:
+        Repository.update_alert(a["alert_id"], {"is_read": True}, organization_id=org_id)
+        count += 1
+    return api_response(data={"acknowledged_count": count}, message="All alerts acknowledged", status_code=200)

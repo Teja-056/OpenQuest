@@ -1,17 +1,15 @@
 """
-AI Shield - Automated Incident and Alert Generator.
-Evaluates processed security events and generates corresponding alerts and incidents in Supabase.
-
-CRITICAL REQUIREMENTS:
-1. High and critical risk events trigger alerts.
-2. Hard denials and critical violations trigger incidents.
-3. Deduplication: Avoids duplicate alerts or incidents for the same event_id.
-4. Transparency: Clearly states simulated/recommended actions without false enforcement claims.
+AI Shield — Automated Incident and Alert Generator.
+Evaluates processed security events and generates corresponding alerts and incidents.
+Enforces multi-tenant organization isolation, deduplication, and 8-part deterministic explanations.
 """
 
 import uuid
+import json
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
+from backend.repository import Repository
+from security.explanations import generate_incident_explanation
 
 def generate_alert_type(event_type: str, rule_result: str) -> str:
     """Map rule result and event type to a standard alert type category."""
@@ -31,16 +29,15 @@ def generate_alert_type(event_type: str, rule_result: str) -> str:
 def evaluate_and_generate_alerts(
     event_record: Dict[str, Any],
     risk_assessment: Dict[str, Any],
-    supabase_client
+    supabase_client=None
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Generate alerts and incidents for high/critical security events.
+    Persists through unified repository with tenant organization isolation.
     Returns: (alert_record, incident_record)
     """
-    if not supabase_client:
-        return None, None
-
     event_id = event_record.get("event_id")
+    org_id = event_record.get("organization_id", "org_default")
     actor_id = event_record.get("actor_id", "unknown_actor")
     resource = event_record.get("resource", "unspecified_resource")
     action = event_record.get("action", "unknown_action")
@@ -55,9 +52,9 @@ def evaluate_and_generate_alerts(
     created_alert = None
     created_incident = None
 
-    # Check eligibility: Alerts are triggered for high or critical risk
+    # Check eligibility: Alerts triggered for high or critical risk
     should_alert = risk_level in ("high", "critical") or hard_denial
-    # Incidents are created for critical violations or confirmed hard denials
+    # Incidents created for critical violations or confirmed hard denials
     should_create_incident = risk_level == "critical" or hard_denial
 
     if not should_alert and not should_create_incident:
@@ -69,19 +66,36 @@ def evaluate_and_generate_alerts(
     if should_create_incident:
         try:
             # Check deduplication: does an incident already exist for this event_id?
-            existing_inc = supabase_client.table("security_incidents").select("*").eq("event_id", event_id).execute()
-            if existing_inc.data:
-                created_incident = existing_inc.data[0]
+            if supabase_client is not None:
+                existing_res = supabase_client.table("security_incidents").select("*").eq("event_id", event_id).execute()
+                existing_incs = existing_res.data or []
+            else:
+                existing_incs, _ = Repository.list_incidents(organization_id=org_id, filters={"event_id": event_id}, limit=1)
+
+            if existing_incs:
+                created_incident = existing_incs[0]
                 incident_id = created_incident.get("incident_id")
             else:
                 incident_id = f"INC-{uuid.uuid4().hex[:8].upper()}"
-                title = f"Simulated Security Violation: {rule_result} ({event_id})"
+                title = f"Security Violation: {rule_result} ({event_id})"
+
+                # Build 8-part structured explanation
+                explanation = generate_incident_explanation(event_record, risk_assessment)
                 description = (
-                    f"Simulated security event flagged. Actor '{actor_id}' performed '{action}' on '{resource}'. "
-                    f"Risk Level: {risk_level.upper()}. Recommended Action: {recommended_action}."
+                    f"Incident Investigation Summary for {event_id}:\n"
+                    f"- What: {explanation['what']}\n"
+                    f"- Actor: {explanation['who']}\n"
+                    f"- Resource: {explanation['resource']}\n"
+                    f"- Suspicion: {explanation['suspicion_reason']}\n"
+                    f"- Policy: {explanation['rule_triggered']}\n"
+                    f"- ML Signal: {explanation['ml_prediction']}\n"
+                    f"- Risk Assessment: {explanation['risk_score']}\n"
+                    f"- Recommended Remediation:\n{explanation['recommended_action']}"
                 )
+
                 inc_record = {
                     "incident_id": incident_id,
+                    "organization_id": org_id,
                     "title": title,
                     "description": description,
                     "severity": risk_level,
@@ -93,8 +107,11 @@ def evaluate_and_generate_alerts(
                     "created_at": now_iso,
                     "updated_at": now_iso
                 }
-                res = supabase_client.table("security_incidents").insert(inc_record).execute()
-                created_incident = res.data[0] if res.data else inc_record
+                if supabase_client is not None:
+                    ins_res = supabase_client.table("security_incidents").insert(inc_record).execute()
+                    created_incident = ins_res.data[0] if (ins_res and ins_res.data) else inc_record
+                else:
+                    created_incident = Repository.create_incident(inc_record)
         except Exception as e:
             print(f"[Pipeline] Warning: Failed to create incident for event {event_id}: {e}")
 
@@ -102,9 +119,14 @@ def evaluate_and_generate_alerts(
     if should_alert:
         try:
             # Check deduplication: does an alert already exist for this event_id?
-            existing_alt = supabase_client.table("alerts").select("*").eq("event_id", event_id).execute()
-            if existing_alt.data:
-                created_alert = existing_alt.data[0]
+            if supabase_client is not None:
+                existing_res = supabase_client.table("alerts").select("*").eq("event_id", event_id).execute()
+                existing_alts = existing_res.data or []
+            else:
+                existing_alts, _ = Repository.list_alerts(organization_id=org_id, filters={"event_id": event_id}, limit=1)
+
+            if existing_alts:
+                created_alert = existing_alts[0]
             else:
                 alert_id = f"ALT-{uuid.uuid4().hex[:8].upper()}"
                 alert_type = generate_alert_type(event_type, rule_result)
@@ -114,6 +136,7 @@ def evaluate_and_generate_alerts(
                 )
                 alt_record = {
                     "alert_id": alert_id,
+                    "organization_id": org_id,
                     "event_id": event_id,
                     "incident_id": incident_id,
                     "alert_type": alert_type,
@@ -122,9 +145,13 @@ def evaluate_and_generate_alerts(
                     "is_read": False,
                     "created_at": now_iso
                 }
-                res = supabase_client.table("alerts").insert(alt_record).execute()
-                created_alert = res.data[0] if res.data else alt_record
+                if supabase_client is not None:
+                    ins_res = supabase_client.table("alerts").insert(alt_record).execute()
+                    created_alert = ins_res.data[0] if (ins_res and ins_res.data) else alt_record
+                else:
+                    created_alert = Repository.create_alert(alt_record)
         except Exception as e:
+            print(f"[Pipeline] Warning: Failed to create alert for event {event_id}: {e}")
             print(f"[Pipeline] Warning: Failed to create alert for event {event_id}: {e}")
 
     return created_alert, created_incident

@@ -1,19 +1,13 @@
 """
-AI Shield - Central Event Processing Pipeline Orchestrator.
+AI Shield — Central Event Processing Pipeline Orchestrator.
 Orchestrates the entire event lifecycle:
-Receive Event → Validate Event → Evaluate Security Rules → Obtain ML Result →
-Calculate Risk → Store Results in Supabase → Generate Incident/Alert
-
-Architecture:
-- Modular, decoupled, extensible.
-- Strictly adheres to docs/api_contract.md.
-- Reuses existing validation and Supabase singleton.
-- Enforces hard denial preservation.
+Receive Event → Validate Event → Duplicate Check → Evaluate Rules → Score ML →
+Calculate Risk → Store Results via Multi-Tenant Repository → Generate Incident/Alert
 """
 
 import uuid
 from typing import Dict, Any, Tuple
-from backend.database import get_supabase_client
+from backend.repository import Repository
 from backend.utils.validation import validate_event_payload, get_current_iso_timestamp
 from backend.pipeline.security_adapter import get_security_adapter
 from backend.pipeline.ml_adapter import get_ml_adapter
@@ -33,12 +27,17 @@ def process_security_event(raw_payload: Dict[str, Any], client=None) -> Tuple[bo
         return False, err_msg, 400
 
     try:
-        supabase = client or get_supabase_client()
+        org_id = cleaned.get("organization_id", "org_default")
 
         # STEP 2: DUPLICATE CHECK (Event ID)
-        check_res = supabase.table("security_events").select("event_id").eq("event_id", cleaned["event_id"]).execute()
-        if check_res.data:
-            return False, f"Event with event_id '{cleaned['event_id']}' already exists", 409
+        if client is not None:
+            check_res = client.table("security_events").select("event_id").eq("event_id", cleaned["event_id"]).execute()
+            if check_res.data:
+                return False, f"Event with event_id '{cleaned['event_id']}' already exists", 409
+        else:
+            existing_event = Repository.get_event(cleaned["event_id"], organization_id=org_id)
+            if existing_event:
+                return False, f"Event with event_id '{cleaned['event_id']}' already exists", 409
 
         # STEP 3: EVALUATE SECURITY RULES
         sec_adapter = get_security_adapter()
@@ -58,34 +57,30 @@ def process_security_event(raw_payload: Dict[str, Any], client=None) -> Tuple[bo
         cleaned["risk_level"] = risk_assessment["risk_level"]
         cleaned["recommended_action"] = risk_assessment["recommended_action"]
 
-        # STEP 6: STORE ENRICHED EVENT IN SUPABASE
-        insert_res = supabase.table("security_events").insert(cleaned).execute()
-        saved_event = insert_res.data[0] if insert_res.data else cleaned
+        # Clearly distinguish telemetry ingestion from actual access enforcement
+        is_flagged = str(risk_assessment.get("rule_result", "")).startswith("flagged_")
+        action_permitted = not (is_flagged or risk_assessment.get("hard_denial_preserved", False))
+        cleaned["action_permitted"] = action_permitted
+
+        # STEP 6: STORE ENRICHED EVENT IN REPOSITORY (Multi-Tenant Persistence)
+        if client is not None:
+            insert_res = client.table("security_events").insert(cleaned).execute()
+            saved_event = insert_res.data[0] if (insert_res and insert_res.data) else cleaned
+        else:
+            saved_event = Repository.create_event(cleaned)
 
         # STEP 7: AUTOMATIC INCIDENTS AND ALERTS (DEDUPLICATED)
         alert_record, incident_record = evaluate_and_generate_alerts(
-            saved_event, risk_assessment, supabase
+            saved_event, risk_assessment, client
         )
-
-        # STEP 8: RECORD ACTIVITY LOG
-        try:
-            log_id = f"LOG-{uuid.uuid4().hex[:8].upper()}"
-            supabase.table("activity_logs").insert({
-                "log_id": log_id,
-                "action": "ingest_security_event",
-                "performed_by": cleaned.get("actor_id", "system"),
-                "details": f"Processed {cleaned['event_id']} ({cleaned['event_type']}) - Risk: {cleaned['risk_level'].upper()}",
-                "ip_address": "127.0.0.1",
-                "timestamp": get_current_iso_timestamp()
-            }).execute()
-        except Exception as log_err:
-            print(f"[Pipeline] Notice: Activity log write bypassed: {log_err}")
 
         pipeline_output = {
             "event": saved_event,
             "risk_assessment": risk_assessment,
             "alert": alert_record,
-            "incident": incident_record
+            "incident": incident_record,
+            "action_permitted": action_permitted,
+            "enforcement_status": "permitted" if action_permitted else "blocked"
         }
 
         return True, pipeline_output, 201
@@ -94,6 +89,6 @@ def process_security_event(raw_payload: Dict[str, Any], client=None) -> Tuple[bo
         return False, f"Database configuration error: {str(re)}", 503
     except Exception as e:
         err_str = str(e)
-        if "23505" in err_str or "duplicate key" in err_str:
+        if "23505" in err_str or "duplicate key" in err_str or "UNIQUE constraint" in err_str:
             return False, f"Duplicate event_id conflict: {err_str}", 409
         return False, f"Pipeline processing failed: {err_str}", 500

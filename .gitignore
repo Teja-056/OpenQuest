@@ -9,6 +9,11 @@ dist/
 backend/.env
 backend/.env.*
 *.db
+*.sqlite
 *.sqlite3
 ml/model/*.pkl
 .vscode/
+.pytest_cache/
+frontend/tsconfig.tsbuildinfo
+backend/quarantine/*
+!backend/quarantine/.gitkeep

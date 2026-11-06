@@ -9,7 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import supabase
-from supabase import Client, create_client
+from supabase import Client, create_client, ClientOptions
 from backend.config import Config
 
 # Reusable client singleton
@@ -19,6 +19,7 @@ def get_supabase_client() -> Client:
     """
     Return an initialized Supabase client singleton using the service role key.
     Raises RuntimeError if Supabase credentials are missing or unconfigured.
+    Uses a fast 3.0s timeout to prevent thread blocking when remote connections stall.
     """
     global _supabase_client
     if _supabase_client is not None:
@@ -30,7 +31,8 @@ def get_supabase_client() -> Client:
             "and SUPABASE_SERVICE_ROLE_KEY in backend/.env"
         )
 
-    _supabase_client = create_client(Config.SUPABASE_URL, Config.SUPABASE_SERVICE_ROLE_KEY)
+    opts = ClientOptions(postgrest_client_timeout=3.0)
+    _supabase_client = create_client(Config.SUPABASE_URL, Config.SUPABASE_SERVICE_ROLE_KEY, options=opts)
     return _supabase_client
 
 def set_supabase_client(client: Optional[Client]):
@@ -58,6 +60,11 @@ def check_supabase_connection() -> Tuple[bool, str]:
         response = client.table("employees").select("count", count="exact").limit(0).execute()
         return True, f"Successfully connected to Supabase PostgreSQL at {Config.SUPABASE_URL}"
     except Exception as e:
+        try:
+            from backend.repository import Repository
+            Repository.record_supabase_failure(e)
+        except Exception:
+            pass
         err_msg = str(e)
         if "relation \"public.employees\" does not exist" in err_msg or "PGRST204" in err_msg:
             return False, "Connected to Supabase, but schema not found. Please execute backend/migrations/001_initial_schema.sql in Supabase SQL Editor."

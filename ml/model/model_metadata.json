@@ -1,0 +1,35 @@
+{
+  "model_name": "IsolationForest-BehavioralAnomaly",
+  "algorithm": "IsolationForest",
+  "training_samples": 2400,
+  "test_samples": 600,
+  "features": [
+    "sensitive_file_access_count",
+    "downloads_24h",
+    "external_sharing_count",
+    "activity_volume",
+    "failed_access_attempts",
+    "request_frequency",
+    "is_off_hours",
+    "is_weekend",
+    "sensitive_resource_frequency",
+    "unusual_destination"
+  ],
+  "contamination": 0.08,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1_score": 1.0,
+  "roc_auc": 1.0,
+  "confusion_matrix": [
+    [
+      552,
+      0
+    ],
+    [
+      0,
+      48
+    ]
+  ],
+  "artifact_path": "C:\\Users\\tejaj\\OneDrive\\Documents\\ChatGPT\\Open Quest\\ml\\model\\isolation_forest.joblib",
+  "training_date": "2026-11-05 18:30:27.244340+00:00"
+}

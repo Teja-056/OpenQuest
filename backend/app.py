@@ -14,7 +14,18 @@ from backend.routes.employees import employees_bp
 from backend.routes.events import events_bp
 from backend.routes.incidents import incidents_bp
 from backend.routes.alerts import alerts_bp
+from backend.routes.auth import auth_bp
+from backend.routes.dashboard import dashboard_bp
+from backend.routes.agents import agents_bp
+from backend.routes.dlp import dlp_bp
+from backend.routes.threats import threats_bp
 from backend.utils.response import error_response
+from backend.middleware.threat_detector import get_threat_detector
+
+# Register production security and ML adapters
+from backend.pipeline import set_security_adapter, set_ml_adapter
+from security.rule_engine import ProductionSecurityRuleEngine
+from ml.anomaly_detector import ProductionMLAnomalyDetector
 
 def create_app(test_config=None):
     """
@@ -29,6 +40,25 @@ def create_app(test_config=None):
     if test_config:
         app.config.update(test_config)
 
+    # Validate production configuration security
+    if hasattr(Config, "validate_production_config"):
+        try:
+            Config.validate_production_config()
+        except Exception as conf_err:
+            print(f"[Config] Security Warning: {conf_err}")
+
+    # Register production engines
+    set_security_adapter(ProductionSecurityRuleEngine())
+    set_ml_adapter(ProductionMLAnomalyDetector())
+
+    # In testing mode, reset baseline reference agents for test isolation
+    if app.config.get("TESTING"):
+        try:
+            from security.agent_guard import AgentGuard
+            AgentGuard.reset_initial_agents()
+        except Exception:
+            pass
+
     # Log Supabase configuration state on startup
     if Config.is_supabase_configured():
         print(f"[App] Supabase configured with URL: {Config.SUPABASE_URL}")
@@ -41,20 +71,46 @@ def create_app(test_config=None):
     app.register_blueprint(events_bp)
     app.register_blueprint(incidents_bp)
     app.register_blueprint(alerts_bp)
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(dashboard_bp)
+    app.register_blueprint(agents_bp)
+    app.register_blueprint(dlp_bp)
+    app.register_blueprint(threats_bp)
 
-    # Root route for quick discovery
+    # API Threat & Rate Limiting Middleware
+    @app.before_request
+    def intercept_api_threats():
+        if request.method == "OPTIONS" or request.path in ("/api/health", "/api/threats/status", "/"):
+            return None
+        # In test mode, allow burst bypass unless specifically testing rate limiter
+        if app.config.get("TESTING") and not app.config.get("ENABLE_RATE_LIMIT_IN_TESTS"):
+            return None
+
+        detector = get_threat_detector()
+        is_allowed, reason, threat_score = detector.evaluate_request()
+        if not is_allowed:
+            return error_response(reason or "Rate limit exceeded", 429, details={"threat_score": threat_score})
+
+    # Root route for discovery
     @app.route("/", methods=["GET"])
     def root():
         return jsonify({
             "service": "AI Shield Security Platform API",
+            "version": "1.0.0",
             "database_backend": "Supabase PostgreSQL",
             "status": "online",
             "endpoints": [
                 "/api/health",
+                "/api/dashboard/stats",
+                "/api/auth/login",
                 "/api/employees",
                 "/api/events",
                 "/api/incidents",
-                "/api/alerts"
+                "/api/alerts",
+                "/api/agents",
+                "/api/dlp/violations",
+                "/api/dlp/inspect",
+                "/api/threats"
             ],
             "documentation": "/docs/api_contract.md"
         }), 200
@@ -80,6 +136,10 @@ def create_app(test_config=None):
     @app.errorhandler(405)
     def method_not_allowed(e):
         return error_response("HTTP method not allowed for this endpoint", 405)
+
+    @app.errorhandler(429)
+    def rate_limit_error(e):
+        return error_response("Too Many Requests: Rate limit exceeded", 429)
 
     @app.errorhandler(500)
     def internal_error(e):
