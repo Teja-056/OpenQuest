@@ -8,7 +8,14 @@ import {
   DLPViolation,
   SecurityPolicy,
   APIThreatLog,
-  UserSession
+  UserSession,
+  OrganizationProfile,
+  CloudIntegration,
+  WazuhIntegration,
+  SubscriptionStatus,
+  AuditLog,
+  ExecutiveReport,
+  Employee
 } from '../types';
 
 const BASE_URL = '/api';
@@ -175,4 +182,120 @@ export const api = {
   getThreats: (limit: number = 50): Promise<APIThreatLog[]> => request<APIThreatLog[]>(`/threats?limit=${limit}`),
 
   getThreatStatus: () => request<{ blocked_clients: Array<{ client_ip: string; remaining_seconds: number }>; blocked_count: number; burst_limit: number; window_seconds: number }>('/threats/status'),
+
+  // SaaS Multi-Tenant Registration & Onboarding
+  registerCompany: async (payload: {
+    company_name: string;
+    owner_name: string;
+    email: string;
+    phone?: string;
+    industry?: string;
+    country?: string;
+    employee_count?: number;
+    password: string;
+    subscription_tier?: string;
+  }): Promise<{ token: string; user: UserSession; organization: OrganizationProfile }> => {
+    const data = await request<{ token: string; user: UserSession; organization: OrganizationProfile }>('/auth/register-company', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    localStorage.setItem('ai_shield_token', data.token);
+    localStorage.setItem('ai_shield_user', JSON.stringify(data.user));
+    return data;
+  },
+
+  updateOnboarding: (data: {
+    step: number;
+    completed?: boolean;
+    industry?: string;
+    country?: string;
+    employee_count?: number;
+    cloud?: { account_id: string; role_arn: string; regions: string[] };
+    endpoint?: { manager_url: string };
+    subscription_tier?: string;
+  }) => {
+    return request<{ organization: OrganizationProfile; step: number; completed: boolean }>('/auth/onboarding', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+
+  getOnboardingStatus: () => request<{
+    organization: OrganizationProfile;
+    cloud_integration: CloudIntegration;
+    wazuh_integration: WazuhIntegration;
+    subscription: any;
+    onboarding_completed: boolean;
+    current_step: number;
+  }>('/auth/onboarding-status'),
+
+  // AWS Cloud Integration
+  getAwsStatus: () => request<{ integration: CloudIntegration; is_connected: boolean; trust_policy: any }>('/cloud/aws/status'),
+
+  connectAws: (data: { account_id: string; role_arn: string; regions: string[] }) => {
+    return request<{ integration: CloudIntegration; test_result: any }>('/cloud/aws/connect', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+
+  syncAws: () => request<{
+    cloudtrail_events_count: number;
+    security_hub_findings_count: number;
+    ingested_into_pipeline: number;
+    cloudtrail_events: any[];
+    security_hub_findings: any[];
+  }>('/cloud/aws/sync', { method: 'POST' }),
+
+  getAwsTrustPolicy: () => request<{ trust_policy: any; external_id: string }>('/cloud/aws/trust-policy'),
+
+  // Wazuh Endpoint Integration
+  getWazuhStatus: () => request<{
+    integration: WazuhIntegration;
+    is_connected: boolean;
+    enrollment_commands: { linux: string; windows: string; webhook_endpoint: string };
+  }>('/integrations/wazuh/status'),
+
+  configureWazuh: (data: { manager_url: string }) => {
+    return request<WazuhIntegration>('/integrations/wazuh/configure', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+
+  // Subscription Management
+  getSubscription: (): Promise<SubscriptionStatus> => request<SubscriptionStatus>('/subscription'),
+
+  getSubscriptionTiers: () => request<any[]>('/subscription/tiers'),
+
+  upgradeSubscription: (tier: string) => {
+    return request<any>('/subscription/upgrade', {
+      method: 'POST',
+      body: JSON.stringify({ tier }),
+    });
+  },
+
+  // Organization & Executive Reports
+  getOrgProfile: (): Promise<OrganizationProfile> => request<OrganizationProfile>('/organization/profile'),
+
+  updateOrgProfile: (data: Partial<OrganizationProfile>): Promise<OrganizationProfile> => {
+    return request<OrganizationProfile>('/organization/profile', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  },
+
+  getOrgAuditLogs: (limit: number = 50): Promise<AuditLog[]> => request<AuditLog[]>(`/organization/audit-logs?limit=${limit}`),
+
+  getOrgExecutiveReport: (): Promise<ExecutiveReport> => request<ExecutiveReport>('/organization/report'),
+
+  // Employees Management
+  getEmployees: (params?: { limit?: number; offset?: number; department?: string; status?: string }): Promise<Employee[]> => {
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    if (params?.department) query.set('department', params.department);
+    if (params?.status) query.set('status', params.status);
+    return request<Employee[]>(`/employees?${query.toString()}`);
+  },
 };

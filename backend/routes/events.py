@@ -81,10 +81,14 @@ def create_event():
         return error_response("Request body must be JSON with Content-Type: application/json", 400)
 
     payload = request.get_json()
-    # Enforce tenant isolation on incoming events
+    # Enforce strict tenant isolation on incoming events (prevent spoofing)
     org_id = get_tenant_organization_id()
-    if not payload.get("organization_id"):
+    from backend.auth import get_current_user
+    user = get_current_user()
+    if user and user.get("role") != "SUPER_ADMIN":
         payload["organization_id"] = org_id
+    elif not payload.get("organization_id"):
+        payload["organization_id"] = org_id or "org_default"
 
     success, result, status_code = process_security_event(payload)
     if not success:

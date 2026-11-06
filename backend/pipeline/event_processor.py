@@ -13,6 +13,7 @@ from backend.pipeline.security_adapter import get_security_adapter
 from backend.pipeline.ml_adapter import get_ml_adapter
 from backend.pipeline.risk_engine import calculate_composite_risk
 from backend.pipeline.incident_generator import evaluate_and_generate_alerts
+from backend.integrations.jev_client import JevClient
 
 def process_security_event(raw_payload: Dict[str, Any], client=None) -> Tuple[bool, Any, int]:
     """
@@ -62,6 +63,11 @@ def process_security_event(raw_payload: Dict[str, Any], client=None) -> Tuple[bo
         action_permitted = not (is_flagged or risk_assessment.get("hard_denial_preserved", False))
         cleaned["action_permitted"] = action_permitted
 
+        # STEP 5.5: TYPESAFE JEV AI DECISION SUPPORT LAYER
+        hard_denial_applied = bool(risk_assessment.get("hard_denial_preserved", False))
+        jev_assessment = JevClient.evaluate_security_event(cleaned, rule_override_applied=hard_denial_applied)
+        risk_assessment["jev_assessment"] = jev_assessment
+
         # STEP 6: STORE ENRICHED EVENT IN REPOSITORY (Multi-Tenant Persistence)
         if client is not None:
             insert_res = client.table("security_events").insert(cleaned).execute()
@@ -77,6 +83,7 @@ def process_security_event(raw_payload: Dict[str, Any], client=None) -> Tuple[bo
         pipeline_output = {
             "event": saved_event,
             "risk_assessment": risk_assessment,
+            "jev_assessment": jev_assessment,
             "alert": alert_record,
             "incident": incident_record,
             "action_permitted": action_permitted,

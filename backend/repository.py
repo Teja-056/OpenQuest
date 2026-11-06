@@ -5,6 +5,7 @@ Enforces fail-closed security, atomic Agent Guard concurrency, and organization-
 """
 
 import os
+import re
 import json
 import sqlite3
 import uuid
@@ -234,7 +235,82 @@ def init_local_db():
         features TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL
     );
+
+    -- 13. CLOUD INTEGRATIONS (AWS STS ASSUMEROLE)
+    CREATE TABLE IF NOT EXISTS cloud_integrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        integration_id TEXT UNIQUE NOT NULL,
+        organization_id TEXT NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'AWS',
+        account_id TEXT NOT NULL,
+        role_arn TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        regions TEXT NOT NULL DEFAULT '["us-east-1"]',
+        status TEXT NOT NULL DEFAULT 'UNCONFIGURED',
+        last_tested_at TEXT,
+        last_sync_at TEXT,
+        findings_count INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT,
+        config_details TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    -- 14. WAZUH INTEGRATIONS
+    CREATE TABLE IF NOT EXISTS wazuh_integrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        integration_id TEXT UNIQUE NOT NULL,
+        organization_id TEXT NOT NULL UNIQUE,
+        webhook_secret TEXT NOT NULL,
+        manager_url TEXT,
+        status TEXT NOT NULL DEFAULT 'UNCONFIGURED',
+        agent_count INTEGER NOT NULL DEFAULT 0,
+        last_alert_at TEXT,
+        error_message TEXT,
+        api_config TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    -- 15. SUBSCRIPTIONS
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        organization_id TEXT NOT NULL UNIQUE,
+        tier TEXT NOT NULL DEFAULT 'STARTER',
+        max_endpoints INTEGER NOT NULL DEFAULT 5,
+        max_cloud_accounts INTEGER NOT NULL DEFAULT 1,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        current_endpoints_count INTEGER NOT NULL DEFAULT 0,
+        current_cloud_accounts_count INTEGER NOT NULL DEFAULT 0,
+        features TEXT NOT NULL DEFAULT '["basic_monitoring", "incident_management"]',
+        billing_period TEXT NOT NULL DEFAULT 'monthly',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    -- 16. AUDIT LOGS
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        log_id TEXT UNIQUE NOT NULL,
+        organization_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        actor_email TEXT,
+        action TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        details TEXT,
+        ip_address TEXT,
+        timestamp TEXT NOT NULL
+    );
     """)
+
+    # Seed baseline default subscription if absent
+    cursor.execute("SELECT COUNT(*) FROM subscriptions WHERE organization_id = 'org_default'")
+    if cursor.fetchone()[0] == 0:
+        now_ts = datetime.now(timezone.utc).isoformat()
+        cursor.execute("""
+            INSERT OR IGNORE INTO subscriptions (organization_id, tier, max_endpoints, max_cloud_accounts, is_active, features, created_at, updated_at)
+            VALUES ('org_default', 'ENTERPRISE', 1000, 50, 1, '["basic_monitoring", "incident_management", "ai_assessments", "cloud_security", "priority_support"]', ?, ?)
+        """, (now_ts, now_ts))
 
     # Automatic migration: ensure organization_id and action_permitted exist on pre-existing tables
     tables_needing_org = [
@@ -249,6 +325,30 @@ def init_local_db():
                 cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN organization_id TEXT NOT NULL DEFAULT 'org_default'")
         except Exception as mig_err:
             print(f"[Repository] Column migration notice ({tbl}): {mig_err}")
+
+    # Ensure organizations table has all SaaS onboarding columns
+    org_columns = {
+        "owner_name": "TEXT",
+        "email": "TEXT",
+        "phone": "TEXT",
+        "industry": "TEXT DEFAULT 'Technology'",
+        "country": "TEXT DEFAULT 'United States'",
+        "employee_count": "INTEGER DEFAULT 10",
+        "subscription_tier": "TEXT DEFAULT 'STARTER'",
+        "cloud_provider": "TEXT DEFAULT 'AWS'",
+        "cloud_status": "TEXT DEFAULT 'UNCONFIGURED'",
+        "wazuh_status": "TEXT DEFAULT 'UNCONFIGURED'",
+        "onboarding_completed": "INTEGER DEFAULT 0",
+        "onboarding_step": "INTEGER DEFAULT 1"
+    }
+    try:
+        cursor.execute("PRAGMA table_info(organizations)")
+        existing_org_cols = [row[1] for row in cursor.fetchall()]
+        for col_name, col_def in org_columns.items():
+            if col_name not in existing_org_cols:
+                cursor.execute(f"ALTER TABLE organizations ADD COLUMN {col_name} {col_def}")
+    except Exception as org_mig_err:
+        print(f"[Repository] Organizations migration notice: {org_mig_err}")
 
     try:
         cursor.execute("PRAGMA table_info(security_events)")
@@ -265,6 +365,10 @@ def init_local_db():
     CREATE INDEX IF NOT EXISTS idx_incidents_org ON security_incidents(organization_id);
     CREATE INDEX IF NOT EXISTS idx_alerts_org ON alerts(organization_id);
     CREATE INDEX IF NOT EXISTS idx_agents_org ON ai_agents(organization_id);
+    CREATE INDEX IF NOT EXISTS idx_cloud_org ON cloud_integrations(organization_id);
+    CREATE INDEX IF NOT EXISTS idx_wazuh_org ON wazuh_integrations(organization_id);
+    CREATE INDEX IF NOT EXISTS idx_subs_org ON subscriptions(organization_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_logs(organization_id);
     """)
 
     # Seed baseline policies if none exist
@@ -457,6 +561,26 @@ class Repository:
         conn = get_local_db_conn()
         cur = conn.cursor()
         cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    @classmethod
+    def get_user_by_email(cls, email: str) -> Optional[Dict[str, Any]]:
+        if not email:
+            return None
+        clean_email = email.strip().lower()
+        if cls._is_table_in_supabase("users"):
+            try:
+                res = get_supabase_client().table("users").select("*").eq("email", clean_email).limit(1).execute()
+                if res.data:
+                    return res.data[0]
+            except Exception:
+                pass
+
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE LOWER(email) = ?", (clean_email,))
         row = cur.fetchone()
         conn.close()
         return dict(row) if row else None
@@ -1958,3 +2082,472 @@ class Repository:
                 except Exception:
                     d[json_col] = []
         return d
+
+    # --------------------------------------------------------------------------
+    # SAAS ORGANIZATIONS (MULTI-TENANT)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def create_organization(cls, org_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Register a new SaaS organization and initialize tenant resources."""
+        init_local_db()
+        now = get_iso_now()
+        org_id = org_data.get("organization_id")
+        if not org_id:
+            slug = re.sub(r'[^a-zA-Z0-9]', '', org_data.get("name", "org")).lower()[:12]
+            org_id = f"org_{slug}_{uuid.uuid4().hex[:6]}"
+
+        tier = org_data.get("subscription_tier", "STARTER").upper()
+        if tier not in ("STARTER", "PROFESSIONAL", "ENTERPRISE"):
+            tier = "STARTER"
+
+        record = {
+            "organization_id": org_id,
+            "name": org_data["name"],
+            "owner_name": org_data.get("owner_name", ""),
+            "email": org_data.get("email", ""),
+            "phone": org_data.get("phone", ""),
+            "industry": org_data.get("industry", "Technology"),
+            "country": org_data.get("country", "United States"),
+            "employee_count": int(org_data.get("employee_count", 10)),
+            "subscription_tier": tier,
+            "cloud_provider": org_data.get("cloud_provider", "AWS"),
+            "cloud_status": org_data.get("cloud_status", "UNCONFIGURED"),
+            "wazuh_status": org_data.get("wazuh_status", "UNCONFIGURED"),
+            "onboarding_completed": 1 if org_data.get("onboarding_completed") else 0,
+            "onboarding_step": int(org_data.get("onboarding_step", 1)),
+            "plan": tier.lower(),
+            "is_active": 1,
+            "created_at": now,
+            "updated_at": now
+        }
+
+        # Store in local SQLite
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO organizations (
+                organization_id, name, owner_name, email, phone, industry, country,
+                employee_count, subscription_tier, cloud_provider, cloud_status,
+                wazuh_status, onboarding_completed, onboarding_step, plan, is_active,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            record["organization_id"], record["name"], record["owner_name"], record["email"],
+            record["phone"], record["industry"], record["country"], record["employee_count"],
+            record["subscription_tier"], record["cloud_provider"], record["cloud_status"],
+            record["wazuh_status"], record["onboarding_completed"], record["onboarding_step"],
+            record["plan"], record["is_active"], record["created_at"], record["updated_at"]
+        ))
+        conn.commit()
+
+        # Initialize tenant subscription
+        limits = {
+            "STARTER": {"endpoints": 5, "cloud": 1},
+            "PROFESSIONAL": {"endpoints": 25, "cloud": 3},
+            "ENTERPRISE": {"endpoints": 1000, "cloud": 50}
+        }.get(tier, {"endpoints": 5, "cloud": 1})
+
+        cur.execute("""
+            INSERT OR REPLACE INTO subscriptions (
+                organization_id, tier, max_endpoints, max_cloud_accounts, is_active,
+                current_endpoints_count, current_cloud_accounts_count, features, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, 0, 0, ?, ?, ?)
+        """, (
+            org_id, tier, limits["endpoints"], limits["cloud"],
+            json.dumps(["basic_monitoring", "incident_management"] if tier == "STARTER" else ["advanced_monitoring", "ai_assessments", "cloud_security"]),
+            now, now
+        ))
+        conn.commit()
+
+        # Initialize tenant Wazuh integration placeholder
+        wazuh_sec = f"whsec_{uuid.uuid4().hex}"
+        cur.execute("""
+            INSERT OR IGNORE INTO wazuh_integrations (
+                integration_id, organization_id, webhook_secret, status, agent_count, created_at, updated_at
+            ) VALUES (?, ?, ?, 'UNCONFIGURED', 0, ?, ?)
+        """, (f"wazuh_{uuid.uuid4().hex[:8]}", org_id, wazuh_sec, now, now))
+        conn.commit()
+
+        # Initialize tenant AWS integration placeholder
+        external_id = f"aishield-{org_id}-{uuid.uuid4().hex[:6]}"
+        cur.execute("""
+            INSERT OR IGNORE INTO cloud_integrations (
+                integration_id, organization_id, provider, account_id, role_arn, external_id,
+                regions, status, created_at, updated_at
+            ) VALUES (?, ?, 'AWS', '', '', ?, '["us-east-1"]', 'UNCONFIGURED', ?, ?)
+        """, (f"cld_{uuid.uuid4().hex[:8]}", org_id, external_id, now, now))
+        conn.commit()
+        conn.close()
+
+        # Sync to Supabase if available
+        if cls._is_table_in_supabase("organizations"):
+            try:
+                supa_record = {
+                    "organization_id": record["organization_id"],
+                    "name": record["name"],
+                    "plan": record["plan"],
+                    "is_active": True
+                }
+                get_supabase_client().table("organizations").upsert(supa_record).execute()
+            except Exception:
+                pass
+
+        return record
+
+    @classmethod
+    def get_organization(cls, organization_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve organization record by organization_id."""
+        init_local_db()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM organizations WHERE organization_id = ?", (organization_id,))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    @classmethod
+    def update_organization(cls, organization_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Safely update organization metadata."""
+        init_local_db()
+        org = cls.get_organization(organization_id)
+        if not org:
+            return None
+
+        allowed_fields = {
+            "name", "owner_name", "email", "phone", "industry", "country",
+            "employee_count", "subscription_tier", "cloud_provider", "cloud_status",
+            "wazuh_status", "onboarding_completed", "onboarding_step", "plan", "is_active"
+        }
+        filtered = {k: v for k, v in updates.items() if k in allowed_fields}
+        if not filtered:
+            return org
+
+        filtered["updated_at"] = get_iso_now()
+        set_clauses = [f"{k} = ?" for k in filtered.keys()]
+        values = list(filtered.values()) + [organization_id]
+
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute(f"UPDATE organizations SET {', '.join(set_clauses)} WHERE organization_id = ?", values)
+        conn.commit()
+        conn.close()
+
+        return cls.get_organization(organization_id)
+
+    @classmethod
+    def list_organizations(cls) -> List[Dict[str, Any]]:
+        """List all registered organizations."""
+        init_local_db()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM organizations ORDER BY created_at DESC")
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+
+    # --------------------------------------------------------------------------
+    # CLOUD INTEGRATIONS (AWS STS ASSUMEROLE)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def get_cloud_integration(cls, organization_id: str, provider: str = "AWS") -> Optional[Dict[str, Any]]:
+        """Retrieve cloud integration credentials and status for organization."""
+        init_local_db()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM cloud_integrations WHERE organization_id = ? AND provider = ?", (organization_id, provider))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            # Create default unconfigured placeholder if missing
+            now = get_iso_now()
+            external_id = f"aishield-{organization_id}-{uuid.uuid4().hex[:6]}"
+            conn = get_local_db_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT OR IGNORE INTO cloud_integrations (
+                    integration_id, organization_id, provider, account_id, role_arn, external_id,
+                    regions, status, created_at, updated_at
+                ) VALUES (?, ?, ?, '', '', ?, '["us-east-1"]', 'UNCONFIGURED', ?, ?)
+            """, (f"cld_{uuid.uuid4().hex[:8]}", organization_id, provider, external_id, now, now))
+            conn.commit()
+            cur.execute("SELECT * FROM cloud_integrations WHERE organization_id = ? AND provider = ?", (organization_id, provider))
+            row = cur.fetchone()
+            conn.close()
+
+        if row:
+            d = dict(row)
+            if isinstance(d.get("regions"), str):
+                try:
+                    d["regions"] = json.loads(d["regions"])
+                except Exception:
+                    d["regions"] = ["us-east-1"]
+            return d
+        return None
+
+    @classmethod
+    def save_cloud_integration(cls, organization_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Save or update AWS integration details."""
+        init_local_db()
+        now = get_iso_now()
+        existing = cls.get_cloud_integration(organization_id, data.get("provider", "AWS"))
+
+        integration_id = existing["integration_id"] if existing else f"cld_{uuid.uuid4().hex[:8]}"
+        external_id = data.get("external_id") or (existing["external_id"] if existing else f"aishield-{organization_id}-{uuid.uuid4().hex[:6]}")
+        provider = data.get("provider", "AWS")
+        account_id = data.get("account_id", "").strip()
+        role_arn = data.get("role_arn", "").strip()
+        regions = data.get("regions", ["us-east-1"])
+        regions_json = json.dumps(regions) if isinstance(regions, list) else str(regions)
+        status = data.get("status", "UNCONFIGURED")
+        findings_count = int(data.get("findings_count", 0))
+        error_message = data.get("error_message")
+        last_tested_at = data.get("last_tested_at", now)
+        last_sync_at = data.get("last_sync_at")
+
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO cloud_integrations (
+                integration_id, organization_id, provider, account_id, role_arn,
+                external_id, regions, status, last_tested_at, last_sync_at,
+                findings_count, error_message, config_details, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
+        """, (
+            integration_id, organization_id, provider, account_id, role_arn,
+            external_id, regions_json, status, last_tested_at, last_sync_at,
+            findings_count, error_message,
+            existing["created_at"] if existing else now, now
+        ))
+        conn.commit()
+
+        # Update org cloud_status
+        cur.execute("UPDATE organizations SET cloud_status = ?, updated_at = ? WHERE organization_id = ?", (status, now, organization_id))
+        conn.commit()
+        conn.close()
+
+        return cls.get_cloud_integration(organization_id, provider)
+
+    # --------------------------------------------------------------------------
+    # WAZUH INTEGRATIONS (WEBHOOK & AGENTS)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def get_wazuh_integration(cls, organization_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve Wazuh integration configuration for organization."""
+        init_local_db()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM wazuh_integrations WHERE organization_id = ?", (organization_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            now = get_iso_now()
+            wsec = f"whsec_{uuid.uuid4().hex}"
+            conn = get_local_db_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT OR IGNORE INTO wazuh_integrations (
+                    integration_id, organization_id, webhook_secret, status, agent_count, created_at, updated_at
+                ) VALUES (?, ?, ?, 'UNCONFIGURED', 0, ?, ?)
+            """, (f"wazuh_{uuid.uuid4().hex[:8]}", organization_id, wsec, now, now))
+            conn.commit()
+            cur.execute("SELECT * FROM wazuh_integrations WHERE organization_id = ?", (organization_id,))
+            row = cur.fetchone()
+            conn.close()
+
+        return dict(row) if row else None
+
+    @classmethod
+    def get_wazuh_by_secret(cls, webhook_secret: str) -> Optional[Dict[str, Any]]:
+        """Look up organization by incoming Wazuh webhook signature / secret."""
+        init_local_db()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM wazuh_integrations WHERE webhook_secret = ?", (webhook_secret.strip(),))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    @classmethod
+    def save_wazuh_integration(cls, organization_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Save or update Wazuh integration configuration."""
+        init_local_db()
+        now = get_iso_now()
+        existing = cls.get_wazuh_integration(organization_id)
+
+        integration_id = existing["integration_id"] if existing else f"wazuh_{uuid.uuid4().hex[:8]}"
+        webhook_secret = data.get("webhook_secret") or (existing["webhook_secret"] if existing else f"whsec_{uuid.uuid4().hex}")
+        manager_url = data.get("manager_url", existing.get("manager_url") if existing else "")
+        status = data.get("status", "UNCONFIGURED")
+        agent_count = int(data.get("agent_count", existing.get("agent_count", 0) if existing else 0))
+        error_message = data.get("error_message")
+        last_alert_at = data.get("last_alert_at", existing.get("last_alert_at") if existing else None)
+
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO wazuh_integrations (
+                integration_id, organization_id, webhook_secret, manager_url, status,
+                agent_count, last_alert_at, error_message, api_config, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
+        """, (
+            integration_id, organization_id, webhook_secret, manager_url, status,
+            agent_count, last_alert_at, error_message,
+            existing["created_at"] if existing else now, now
+        ))
+        conn.commit()
+
+        # Update org wazuh_status
+        cur.execute("UPDATE organizations SET wazuh_status = ?, updated_at = ? WHERE organization_id = ?", (status, now, organization_id))
+        conn.commit()
+        conn.close()
+
+        return cls.get_wazuh_integration(organization_id)
+
+    # --------------------------------------------------------------------------
+    # SUBSCRIPTIONS (MULTI-TENANT LIMITS)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def get_subscription(cls, organization_id: str) -> Dict[str, Any]:
+        """Retrieve tenant subscription, tier, limits, and current utilization."""
+        init_local_db()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM subscriptions WHERE organization_id = ?", (organization_id,))
+        row = cur.fetchone()
+
+        # Count current active cloud accounts
+        cur.execute("SELECT COUNT(*) as cld_cnt FROM cloud_integrations WHERE organization_id = ? AND status = 'CONNECTED'", (organization_id,))
+        cld_count = cur.fetchone()["cld_cnt"]
+
+        # Count current wazuh agents
+        cur.execute("SELECT agent_count FROM wazuh_integrations WHERE organization_id = ?", (organization_id,))
+        w_row = cur.fetchone()
+        endpoints_count = (w_row["agent_count"] if w_row else 0)
+
+        # Also count distinct employee endpoints
+        cur.execute("SELECT COUNT(*) as emp_cnt FROM employees WHERE organization_id = ? AND status = 'active'", (organization_id,))
+        emp_count = cur.fetchone()["emp_cnt"]
+        total_endpoints = max(endpoints_count, emp_count)
+
+        conn.close()
+
+        if row:
+            d = dict(row)
+            d["current_cloud_accounts_count"] = cld_count
+            d["current_endpoints_count"] = total_endpoints
+            if isinstance(d.get("features"), str):
+                try:
+                    d["features"] = json.loads(d["features"])
+                except Exception:
+                    d["features"] = []
+            return d
+
+        # Default fallback
+        return {
+            "organization_id": organization_id,
+            "tier": "STARTER",
+            "max_endpoints": 5,
+            "max_cloud_accounts": 1,
+            "is_active": 1,
+            "current_endpoints_count": total_endpoints,
+            "current_cloud_accounts_count": cld_count,
+            "features": ["basic_monitoring", "incident_management"],
+            "billing_period": "monthly"
+        }
+
+    @classmethod
+    def update_subscription(cls, organization_id: str, tier: str) -> Dict[str, Any]:
+        """Upgrade or update tenant subscription tier and adjust limits."""
+        tier = tier.upper()
+        tier_limits = {
+            "STARTER": {"endpoints": 5, "cloud": 1, "features": ["basic_monitoring", "incident_management"]},
+            "PROFESSIONAL": {"endpoints": 25, "cloud": 3, "features": ["advanced_monitoring", "ai_assessments", "cloud_security", "security_reports"]},
+            "ENTERPRISE": {"endpoints": 1000, "cloud": 50, "features": ["advanced_monitoring", "ai_assessments", "cloud_security", "security_reports", "priority_support", "custom_rules"]}
+        }.get(tier, {"endpoints": 5, "cloud": 1, "features": ["basic_monitoring", "incident_management"]})
+
+        now = get_iso_now()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO subscriptions (
+                organization_id, tier, max_endpoints, max_cloud_accounts, is_active,
+                features, billing_period, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, 'monthly', ?, ?)
+        """, (
+            organization_id, tier, tier_limits["endpoints"], tier_limits["cloud"],
+            json.dumps(tier_limits["features"]), now, now
+        ))
+        cur.execute("UPDATE organizations SET subscription_tier = ?, plan = ?, updated_at = ? WHERE organization_id = ?", (tier, tier.lower(), now, organization_id))
+        conn.commit()
+        conn.close()
+
+        return cls.get_subscription(organization_id)
+
+    @classmethod
+    def check_subscription_limits(cls, organization_id: str, resource_type: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Enforce subscription quota limits:
+        - resource_type == 'endpoint': validates against max_endpoints
+        - resource_type == 'cloud_account': validates against max_cloud_accounts
+        """
+        sub = cls.get_subscription(organization_id)
+        tier = sub.get("tier", "STARTER")
+
+        if resource_type == "endpoint":
+            current = sub.get("current_endpoints_count", 0)
+            max_limit = sub.get("max_endpoints", 5)
+            if current >= max_limit and tier != "ENTERPRISE":
+                return False, f"Subscription limit exceeded: {tier} tier allows up to {max_limit} endpoints. Currently using {current}. Upgrade to Professional or Enterprise.", sub
+            return True, "Within endpoint limits", sub
+
+        elif resource_type == "cloud_account":
+            current = sub.get("current_cloud_accounts_count", 0)
+            max_limit = sub.get("max_cloud_accounts", 1)
+            if current >= max_limit and tier != "ENTERPRISE":
+                return False, f"Subscription limit exceeded: {tier} tier allows up to {max_limit} cloud accounts. Currently connected: {current}. Upgrade to add more cloud accounts.", sub
+            return True, "Within cloud account limits", sub
+
+        return True, "Allowed", sub
+
+    # --------------------------------------------------------------------------
+    # AUDIT LOGS (MULTI-TENANT TRACEABILITY)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def add_audit_log(cls, organization_id: str, actor_id: str, actor_email: str, action: str, resource: str, details: str = "", ip_address: str = "") -> Dict[str, Any]:
+        """Record an immutable audit log entry for compliance and traceability."""
+        init_local_db()
+        log_id = f"AUD-{uuid.uuid4().hex[:8].upper()}"
+        now = get_iso_now()
+        record = {
+            "log_id": log_id,
+            "organization_id": organization_id,
+            "actor_id": actor_id,
+            "actor_email": actor_email,
+            "action": action,
+            "resource": resource,
+            "details": details,
+            "ip_address": ip_address,
+            "timestamp": now
+        }
+
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO audit_logs (log_id, organization_id, actor_id, actor_email, action, resource, details, ip_address, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (log_id, organization_id, actor_id, actor_email, action, resource, details, ip_address, now))
+        conn.commit()
+        conn.close()
+
+        return record
+
+    @classmethod
+    def list_audit_logs(cls, organization_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieve recent audit logs for an organization."""
+        init_local_db()
+        conn = get_local_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM audit_logs WHERE organization_id = ? ORDER BY timestamp DESC LIMIT ?", (organization_id, limit))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows

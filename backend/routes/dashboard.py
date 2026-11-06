@@ -26,8 +26,3 @@ def get_dashboard_stats():
         return error_response("Database configuration error", 503, details=str(re))
     except Exception as e:
         return error_response("Failed to generate dashboard statistics", 500, details=str(e))
-
-    except RuntimeError as re:
-        return error_response("Database configuration error", 503, details=str(re))
-    except Exception as e:
-        return error_response("Failed to generate dashboard statistics", 500, details=str(e))

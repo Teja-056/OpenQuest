@@ -16,11 +16,11 @@ def health_check():
     (Supabase PostgreSQL vs local SQLite fallback) with multi-tenant status.
     Protected by circuit breaker to guarantee < 50ms response time.
     """
-    if Repository.is_supabase_circuit_open():
-        is_supa_connected = False
+    is_supa_connected, conn_msg = check_supabase_connection()
+    if is_supa_connected:
+        Repository.record_supabase_success()
+    elif Repository.is_supabase_circuit_open():
         conn_msg = "Remote Supabase circuit open; operating on local SQLite fallback"
-    else:
-        is_supa_connected, conn_msg = check_supabase_connection()
 
     db_status = Repository.get_database_status()
     active_backend = "supabase" if is_supa_connected else "sqlite_failover"

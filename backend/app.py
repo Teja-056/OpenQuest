@@ -19,6 +19,10 @@ from backend.routes.dashboard import dashboard_bp
 from backend.routes.agents import agents_bp
 from backend.routes.dlp import dlp_bp
 from backend.routes.threats import threats_bp
+from backend.routes.cloud import cloud_bp
+from backend.routes.wazuh import wazuh_bp
+from backend.routes.subscription import subscription_bp
+from backend.routes.organization import org_bp
 from backend.utils.response import error_response
 from backend.middleware.threat_detector import get_threat_detector
 
@@ -76,11 +80,15 @@ def create_app(test_config=None):
     app.register_blueprint(agents_bp)
     app.register_blueprint(dlp_bp)
     app.register_blueprint(threats_bp)
+    app.register_blueprint(cloud_bp)
+    app.register_blueprint(wazuh_bp)
+    app.register_blueprint(subscription_bp)
+    app.register_blueprint(org_bp)
 
     # API Threat & Rate Limiting Middleware
     @app.before_request
     def intercept_api_threats():
-        if request.method == "OPTIONS" or request.path in ("/api/health", "/api/threats/status", "/"):
+        if request.method == "OPTIONS" or request.path in ("/api/health", "/api/threats/status", "/", "/api/integrations/wazuh/alert"):
             return None
         # In test mode, allow burst bypass unless specifically testing rate limiter
         if app.config.get("TESTING") and not app.config.get("ENABLE_RATE_LIMIT_IN_TESTS"):

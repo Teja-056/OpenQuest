@@ -25,11 +25,13 @@ import { UserSession } from '../types';
 interface CyberLoginPageProps {
   onLoginSuccess: (user: UserSession) => void;
   onExploreAsGuest?: () => void;
+  onNavigateToRegister?: () => void;
 }
 
 export const CyberLoginPage: React.FC<CyberLoginPageProps> = ({
   onLoginSuccess,
-  onExploreAsGuest
+  onExploreAsGuest,
+  onNavigateToRegister
 }) => {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('Admin@AIShield2026!');
@@ -144,10 +146,10 @@ export const CyberLoginPage: React.FC<CyberLoginPageProps> = ({
           {/* Top-Right CTA */}
           <div className="flex items-center gap-3">
             <button
-              onClick={() => handleLoginSubmit()}
-              className="flex items-center gap-1.5 px-4 py-2 rounded-full bg-slate-900/80 hover:bg-red-950/60 text-slate-200 hover:text-white border border-red-900/50 text-xs font-semibold transition-all group"
+              onClick={() => onNavigateToRegister ? onNavigateToRegister() : handleLoginSubmit()}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-full bg-slate-900/80 hover:bg-red-950/60 text-slate-200 hover:text-white border border-red-900/50 text-xs font-semibold transition-all group cursor-pointer"
             >
-              <span>Start Free</span>
+              <span>Register Company</span>
               <ArrowUpRight className="w-3.5 h-3.5 text-red-400 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
             </button>
           </div>
@@ -183,11 +185,11 @@ export const CyberLoginPage: React.FC<CyberLoginPageProps> = ({
             {/* Launch Action Buttons */}
             <div className="flex items-center gap-4 pt-2">
               <button
-                onClick={() => handleLoginSubmit()}
+                onClick={() => onNavigateToRegister ? onNavigateToRegister() : handleLoginSubmit()}
                 disabled={isLoading}
-                className="flex items-center gap-2 px-6 py-3 rounded-full bg-white text-black hover:bg-slate-200 text-sm font-bold shadow-[0_0_30px_rgba(255,255,255,0.25)] transition-all active:scale-95 group"
+                className="flex items-center gap-2 px-6 py-3 rounded-full bg-white text-black hover:bg-slate-200 text-sm font-bold shadow-[0_0_30px_rgba(255,255,255,0.25)] transition-all active:scale-95 group cursor-pointer"
               >
-                <span>{isLoading ? 'Authenticating...' : 'Start Free'}</span>
+                <span>{isLoading ? 'Authenticating...' : 'Register Company'}</span>
                 <ArrowUpRight className="w-4 h-4 text-black group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
               </button>
 
@@ -354,11 +356,25 @@ export const CyberLoginPage: React.FC<CyberLoginPageProps> = ({
                   <button
                     type="submit"
                     disabled={isLoading || isAuthSuccess}
-                    className="w-full py-2.5 rounded-xl bg-gradient-to-r from-red-600 via-rose-600 to-red-600 hover:from-red-500 hover:to-rose-500 text-white text-xs font-bold tracking-wider uppercase shadow-lg shadow-red-600/40 border border-red-500/40 transition-all active:scale-[0.99] disabled:opacity-50 flex items-center justify-center gap-2"
+                    className="w-full py-2.5 rounded-xl bg-gradient-to-r from-red-600 via-rose-600 to-red-600 hover:from-red-500 hover:to-rose-500 text-white text-xs font-bold tracking-wider uppercase shadow-lg shadow-red-600/40 border border-red-500/40 transition-all active:scale-[0.99] disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer"
                   >
                     <span>{isLoading ? 'Verifying Security Token...' : isAuthSuccess ? 'Launching Overview...' : 'Login & Launch SOC Overview'}</span>
                     <ArrowUpRight className="w-4 h-4" />
                   </button>
+
+                  {/* Register New Organization Link */}
+                  {onNavigateToRegister && (
+                    <div className="pt-2 text-center text-xs text-slate-400">
+                      New organization?{' '}
+                      <button
+                        type="button"
+                        onClick={onNavigateToRegister}
+                        className="text-red-400 hover:text-red-300 font-semibold underline underline-offset-4 ml-1 cursor-pointer"
+                      >
+                        Register Company & Start Free ↗
+                      </button>
+                    </div>
+                  )}
                 </form>
               </div>
             </div>

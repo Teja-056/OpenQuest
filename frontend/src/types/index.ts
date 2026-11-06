@@ -151,4 +151,143 @@ export interface UserSession {
   email: string;
   role: 'SUPER_ADMIN' | 'ORGANIZATION_ADMIN' | 'SECURITY_ANALYST' | 'EMPLOYEE';
   organization_id: string;
+  organization_name?: string;
+  onboarding_completed?: boolean;
+}
+
+export interface OrganizationProfile {
+  id?: number;
+  organization_id: string;
+  name: string;
+  owner_name?: string;
+  email?: string;
+  phone?: string;
+  industry?: string;
+  country?: string;
+  employee_count?: number;
+  subscription_tier: 'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE';
+  cloud_provider: string;
+  cloud_status: 'UNCONFIGURED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
+  wazuh_status: 'UNCONFIGURED' | 'LISTENING' | 'ACTIVE' | 'ERROR';
+  onboarding_completed: boolean;
+  onboarding_step: number;
+  plan: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CloudIntegration {
+  integration_id: string;
+  organization_id: string;
+  provider: 'AWS' | 'GCP' | 'AZURE';
+  account_id: string;
+  role_arn: string;
+  external_id: string;
+  regions: string[];
+  status: 'UNCONFIGURED' | 'PENDING' | 'CONNECTED' | 'ERROR';
+  last_tested_at?: string;
+  last_sync_at?: string;
+  findings_count: number;
+  error_message?: string;
+}
+
+export interface WazuhIntegration {
+  integration_id: string;
+  organization_id: string;
+  webhook_secret: string;
+  manager_url?: string;
+  status: 'UNCONFIGURED' | 'LISTENING' | 'ACTIVE' | 'ERROR';
+  agent_count: number;
+  last_alert_at?: string;
+  error_message?: string;
+}
+
+export interface SubscriptionStatus {
+  subscription: {
+    organization_id: string;
+    tier: 'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE';
+    max_endpoints: number;
+    max_cloud_accounts: number;
+    is_active: boolean;
+    current_endpoints_count: number;
+    current_cloud_accounts_count: number;
+    features: string[];
+    billing_period: string;
+  };
+  tier_spec: {
+    tier: string;
+    name: string;
+    price_monthly: number;
+    max_endpoints: number;
+    max_cloud_accounts: number;
+    description: string;
+    features: string[];
+  };
+  usage: {
+    endpoints: {
+      current: number;
+      max: number;
+      percentage: number;
+      at_limit: boolean;
+    };
+    cloud_accounts: {
+      current: number;
+      max: number;
+      percentage: number;
+      at_limit: boolean;
+    };
+  };
+}
+
+export interface AuditLog {
+  id?: number;
+  log_id: string;
+  organization_id: string;
+  actor_id: string;
+  actor_email: string;
+  action: string;
+  resource: string;
+  details?: string;
+  ip_address?: string;
+  timestamp: string;
+}
+
+export interface ExecutiveReport {
+  organization_id: string;
+  company_name: string;
+  generated_at: string;
+  compliance_score: number;
+  posture_grade: string;
+  metrics_summary: {
+    total_security_events: number;
+    open_incidents: number;
+    critical_incidents: number;
+    resolved_incidents: number;
+    dlp_violations: number;
+    api_threats_blocked: number;
+    active_ai_agents: number;
+  };
+  integrations: {
+    cloud_provider: string;
+    cloud_status: string;
+    cloud_findings: number;
+    wazuh_status: string;
+    wazuh_agents: number;
+  };
+  subscription_tier: string;
+  recommendations: string[];
+}
+
+export interface Employee {
+  id?: number;
+  employee_id: string;
+  organization_id: string;
+  name: string;
+  email: string;
+  department: string;
+  role: string;
+  risk_score: number;
+  status: 'active' | 'suspended' | 'under_investigation' | 'terminated';
+  created_at: string;
+  updated_at: string;
 }
